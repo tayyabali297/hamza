@@ -11,7 +11,9 @@ Built with Electron + React. Voice input runs fully on-device using Whisper. All
 - Black/white minimal design, pixel art avatar
 - Sidebar with 6 rooms (customisable), each with unlimited renameable chat threads
 - Fast mode (Claude Haiku — cheap, instant) or Deep mode (Claude Sonnet — slower, more nuanced)
-- Mic button that records, transcribes locally, and submits automatically
+- Mic button that records and transcribes live — text appears in the input box as you speak (processed in 10-second segments), so you can review before sending
+- Conversations are automatically named after the first message
+- Deleting a conversation removes it and all memories extracted from it
 - Speaker button on every AI message for text-to-speech
 - Memory page for runtime notes the AI references mid-conversation
 
@@ -79,18 +81,21 @@ hamza/
 ├── src/
 │   ├── App.jsx          # Entire UI + state
 │   │                    #   - Sidebar, chat list, chat view, memory view
-│   │                    #   - callAPI() — fetch to Anthropic with correct headers
-│   │                    #   - speak() — TTS using speechSynthesis
+│   │                    #   - Streaming SSE fetch to Anthropic API
+│   │                    #   - Auto-names chats after first exchange (Haiku, background)
+│   │                    #   - speak() — TTS, prefers Ryan/Christopher for warm deep voice
+│   │                    #   - deleteChat() cleans up messages, API history, and memories
 │   │                    #   - localStorage read/write for all state
 │   │
 │   ├── Avatar.jsx       # Pixel art avatar rendered as SVG rects
 │   │                    #   - 17×14 grid, 4-colour palette, scalable via `sz` prop
 │   │
 │   ├── VoiceButton.jsx  # Mic button component
-│   │                    #   - Records audio with MediaRecorder
-│   │                    #   - Resamples to 16kHz Float32 using AudioContext
+│   │                    #   - Records with MediaRecorder (250ms chunks)
+│   │                    #   - Processes audio in 10s rolling segments for live preview
+│   │                    #   - Resamples each segment to 16kHz Float32 via AudioContext
 │   │                    #   - Sends to main process via window.electronAPI.transcribe()
-│   │                    #   - Auto-submits after successful transcription
+│   │                    #   - Appends transcription live to input box; no auto-submit
 │   │
 │   ├── rooms.js         # Room config + system prompt builder
 │   │                    #   - CATS: array of room definitions
@@ -255,12 +260,15 @@ export const DEEP_ROOMS = ['emotional', 'spiritual']; // or whichever rooms you 
 
 ## How voice input works
 
-1. `VoiceButton.jsx` records audio with `MediaRecorder` (webm/opus format)
-2. When stopped, `AudioContext.decodeAudioData()` decodes the audio
-3. `OfflineAudioContext` resamples to 16000 Hz mono (what Whisper expects)
-4. The Float32Array is sent to the Electron main process via IPC
-5. In `electron/main.js`, `@xenova/transformers` runs Whisper tiny.en using `onnxruntime-node` (Node.js native binary — no browser WASM)
-6. The transcribed text comes back to the renderer and auto-submits
+1. `VoiceButton.jsx` records audio with `MediaRecorder` (webm/opus, 250ms chunks)
+2. Every 10 seconds during recording, only the new chunks since the last pass are resampled to 16kHz mono using `AudioContext` / `OfflineAudioContext`
+3. Each 10-second segment is sent to the Electron main process via IPC
+4. In `electron/main.js`, `@xenova/transformers` runs Whisper tiny.en (Node.js native binary — no browser WASM) and returns the transcribed text
+5. Segment text is appended to the input field in real time — you see what you're saying as you speak
+6. When you click Stop, any remaining unprocessed audio is transcribed and appended as the final pass
+7. You review the full transcript in the input box and send it when ready — no auto-submit
+
+A segment lock prevents concurrent Whisper calls: if one segment is still processing when the next 10-second interval fires, the new call is skipped until the first finishes.
 
 Running Whisper in the main process (Node.js) instead of the renderer avoids the ONNX/WASM path issues that come with running ML models in Electron's Chromium context.
 

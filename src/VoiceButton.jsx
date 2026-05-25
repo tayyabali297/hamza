@@ -6,12 +6,10 @@ import { useState, useRef, useEffect } from 'react';
 async function blobToAudioArray(blob) {
   const arrayBuffer = await blob.arrayBuffer();
 
-  // Decode the raw audio using the browser's native decoder
   const decodeCtx = new AudioContext();
   const decoded   = await decodeCtx.decodeAudioData(arrayBuffer);
   await decodeCtx.close();
 
-  // Resample to 16000 Hz (what Whisper needs)
   const TARGET_SR  = 16000;
   const numFrames  = Math.round(decoded.duration * TARGET_SR);
   const offlineCtx = new OfflineAudioContext(1, numFrames, TARGET_SR);
@@ -21,19 +19,22 @@ async function blobToAudioArray(blob) {
   src.start(0);
 
   const resampled = await offlineCtx.startRendering();
-  // Convert Float32Array → plain Array so IPC can serialize it
   return Array.from(resampled.getChannelData(0));
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
-export default function VoiceButton({ onTranscript, onAutoSubmit, disabled }) {
+export default function VoiceButton({ onTranscript, disabled }) {
   const [phase,  setPhase]  = useState('idle'); // idle | recording | processing
   const [errMsg, setErrMsg] = useState('');
 
-  const recorderRef = useRef(null);
-  const chunksRef   = useRef([]);
-  const streamRef   = useRef(null);
+  const recorderRef       = useRef(null);
+  const chunksRef         = useRef([]);
+  const streamRef         = useRef(null);
+  const accumulatedRef    = useRef('');   // running transcription text
+  const processedCountRef = useRef(0);   // chunks already transcribed
+  const intervalRef       = useRef(null);
+  const segLockRef        = useRef(false); // prevents concurrent segment processing
 
   // Auto-clear error after 6 s
   useEffect(() => {
@@ -41,6 +42,36 @@ export default function VoiceButton({ onTranscript, onAutoSubmit, disabled }) {
     const t = setTimeout(() => setErrMsg(''), 6000);
     return () => clearTimeout(t);
   }, [errMsg]);
+
+  // Transcribe only new chunks since last call, append to accumulated text
+  async function processSegment() {
+    if (segLockRef.current) return; // already processing a segment
+    const allChunks = chunksRef.current;
+    const newChunks = allChunks.slice(processedCountRef.current);
+    if (newChunks.length === 0) return;
+
+    segLockRef.current = true;
+    const nextCount = allChunks.length;
+
+    const blob = new Blob(newChunks, { type: 'audio/webm' });
+    if (blob.size < 500) { segLockRef.current = false; return; }
+
+    try {
+      const audioArray = await blobToAudioArray(blob);
+      const text = await window.electronAPI.transcribe(audioArray);
+      processedCountRef.current = nextCount; // advance only on success
+      if (text) {
+        accumulatedRef.current = accumulatedRef.current
+          ? accumulatedRef.current + ' ' + text
+          : text;
+        onTranscript(accumulatedRef.current.trim());
+      }
+    } catch (err) {
+      console.warn('[VoiceButton] segment error:', err);
+    } finally {
+      segLockRef.current = false;
+    }
+  }
 
   async function start() {
     setErrMsg('');
@@ -54,10 +85,17 @@ export default function VoiceButton({ onTranscript, onAutoSubmit, disabled }) {
     }
 
     const recorder = new MediaRecorder(stream);
-    chunksRef.current = [];
+    chunksRef.current         = [];
+    accumulatedRef.current    = '';
+    processedCountRef.current = 0;
+    segLockRef.current        = false;
+
     recorder.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
     recorder.start(250);
     recorderRef.current = recorder;
+
+    // Process audio in 10-second segments for live preview
+    intervalRef.current = setInterval(processSegment, 10000);
     setPhase('recording');
   }
 
@@ -65,28 +103,34 @@ export default function VoiceButton({ onTranscript, onAutoSubmit, disabled }) {
     const recorder = recorderRef.current;
     if (!recorder || recorder.state === 'inactive') return;
 
+    // Stop periodic transcription immediately
+    clearInterval(intervalRef.current);
+    intervalRef.current = null;
+
     setPhase('processing');
 
     recorder.onstop = async () => {
       streamRef.current?.getTracks().forEach(t => t.stop());
 
       try {
-        const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
+        const remaining = chunksRef.current.slice(processedCountRef.current);
 
-        if (blob.size < 500) {
-          setPhase('idle');
-          return;
+        if (remaining.length > 0) {
+          const blob = new Blob(remaining, { type: 'audio/webm' });
+          if (blob.size >= 500) {
+            const audioArray = await blobToAudioArray(blob);
+            const text = await window.electronAPI.transcribe(audioArray);
+            if (text) {
+              accumulatedRef.current = accumulatedRef.current
+                ? accumulatedRef.current + ' ' + text
+                : text;
+            }
+          }
         }
 
-        // Resample audio in renderer (uses browser AudioContext)
-        const audioArray = await blobToAudioArray(blob);
-
-        // Whisper runs in the Electron main process (onnxruntime-node)
-        const text = await window.electronAPI.transcribe(audioArray);
-
-        if (text) {
-          onTranscript(text);
-          setTimeout(() => onAutoSubmit?.(), 150);
+        if (accumulatedRef.current) {
+          onTranscript(accumulatedRef.current.trim());
+          // No auto-submit — user reviews the transcribed text before sending
         }
       } catch (err) {
         const msg = err?.message || String(err);
@@ -109,29 +153,12 @@ export default function VoiceButton({ onTranscript, onAutoSubmit, disabled }) {
   const isProcessing = phase === 'processing';
 
   const statusLabel =
-    isProcessing ? 'transcribing...' :
-    isRecording  ? 'recording — click to send' :
+    isProcessing ? 'finishing transcription...' :
+    isRecording  ? 'recording — click to stop' :
                    'voice input';
 
   return (
     <div style={{ position: 'relative', flexShrink: 0 }}>
-      <style>{`
-        @keyframes pulse-mic {
-          0%   { box-shadow: 0 0 0 0px rgba(200,50,50,0.35); }
-          70%  { box-shadow: 0 0 0 9px rgba(200,50,50,0); }
-          100% { box-shadow: 0 0 0 0px rgba(200,50,50,0); }
-        }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .vbtn {
-          width: 30px; height: 30px; border-radius: 4px; border: none;
-          display: flex; align-items: center; justify-content: center;
-          flex-shrink: 0; background: transparent; transition: background 0.15s;
-          cursor: pointer;
-        }
-        .vbtn:hover:not(:disabled) { background: #141414; }
-        .vbtn.rec  { animation: pulse-mic 1.2s ease-out infinite; background: #140606; }
-        .vbtn:disabled { cursor: not-allowed; opacity: 0.35; }
-      `}</style>
 
       <button
         className={`vbtn${isRecording ? ' rec' : ''}`}
